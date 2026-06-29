@@ -293,21 +293,153 @@ how it's deployed, not how it behaves):
 
 ---
 
-## 6. Everyday Commands
+## 6. How We Actually Built This (start to finish)
+
+The whole journey was: **scaffold a chart → strip the sample junk → drop in our own
+templates → fill one secret → install.** Here is each step and what happened.
+
+### Step 1 — Scaffold the chart
 
 ```bash
-# render to plain YAML, no cluster touched — your debugging tool
+helm create movie-watchlist
+```
+
+`helm create` builds a folder with a working *sample* nginx chart. It auto-creates these,
+and this is the key thing to understand — **most of them are throwaway demo files**:
+
+```
+movie-watchlist/
+├── Chart.yaml                     ✅ KEEP — we just edit the metadata
+├── values.yaml                    ✅ KEEP — we wipe its contents, write our own
+├── .helmignore                    ✅ keep
+├── charts/                        ❌ delete (empty sample subchart dir)
+└── templates/
+    ├── deployment.yaml            ❌ delete — sample app, not ours
+    ├── service.yaml               ❌ delete
+    ├── serviceaccount.yaml        ❌ delete
+    ├── ingress.yaml               ❌ delete
+    ├── hpa.yaml                    ❌ delete
+    ├── httproute.yaml             ❌ delete
+    ├── NOTES.txt                   ❌ delete
+    ├── _helpers.tpl                ❌ delete (sample label helpers)
+    └── tests/test-connection.yaml ❌ delete
+```
+
+Why delete them? Those sample files reference values like `.Values.service.port` that
+**don't exist in our `values.yaml`**, so `helm template` throws a `nil pointer` error
+until they're gone. They're a demo, not our app.
+
+### Step 2 — Clear the sample templates
+
+```bash
+cd movie-watchlist
+rm -f templates/deployment.yaml templates/service.yaml templates/serviceaccount.yaml \
+      templates/ingress.yaml templates/hpa.yaml templates/httproute.yaml \
+      templates/NOTES.txt templates/_helpers.tpl
+rm -rf templates/tests charts
+ls templates/        # should now be EMPTY
+```
+
+### Step 3 — Write our own files
+
+Two files we **rewrite**, eleven we **add**:
+
+| File | What we do | What we fill in |
+|:---|:---|:---|
+| `Chart.yaml` | edit | name, `version`, `appVersion` |
+| `values.yaml` | replace wholesale | every knob: namespaces, images, ports, db creds, **TMDB key** |
+| `templates/*.yaml` (×11) | write fresh | the manifests, with `{{ .Values.* }}` blanks |
+
+The eleven templates are the three tiers from Section 2. Each one pulls from `values.yaml`
+exactly as mapped in Section 4 — nothing is hardcoded. Here's the one-line job of every
+file (Section 4 has the full value-by-value breakdown):
+
+**Root**
+- `Chart.yaml` — chart name + versions. `version` = the packaging, `appVersion` = the app.
+- `values.yaml` — the single answers sheet every template reads from.
+
+**`templates/` — namespaces**
+- `namespaces.yaml` — loops over the 3 names in values and creates one Namespace each.
+
+**`templates/` — database tier (→ `db-ns-helm`)**
+- `db-secret.yaml` — the `db-credentials` Secret (Postgres user/password/db name).
+- `db-statefulset.yaml` — the Postgres pod `db-0` + its own PVC; reads the Secret via `envFrom`.
+- `db-service.yaml` — headless Service (`clusterIP: None`) so callers reach `db-0` directly.
+
+**`templates/` — backend tier (→ `backend-ns-helm`)**
+- `backend-db-alias.yaml` — ExternalName "db" that forwards across to `db.db-ns-helm.svc…`.
+- `backend-secret.yaml` — `backend-secrets`: `DATABASE_URL` (auto-built from db creds) + `TMDB_API_KEY`.
+- `backend-deployment.yaml` — the FastAPI pod; reads `backend-secrets` via `envFrom`.
+- `backend-service.yaml` — internal ClusterIP Service on `:8000`.
+
+**`templates/` — frontend tier (→ `frontend-ns-helm`)**
+- `frontend-backend-alias.yaml` — ExternalName "backend" forwarding to `backend.backend-ns-helm.svc…`.
+- `frontend-deployment.yaml` — the Nginx pod serving static files + proxying `/api/`.
+- `frontend-service.yaml` — NodePort Service on `:30080`, the only public door.
+
+The flow between them: the **alias** files let each tier keep using short hostnames
+(`db`, `backend`) across namespaces; the **secret** files feed config in via `envFrom`;
+the **service** files give pods stable names; the **deployment/statefulset** files run
+the actual containers. All of it driven by `values.yaml`.
+
+### Step 4 — Fill the ONE thing only you know
+
+Everything else has a sensible default. The single value you must supply is your TMDB key:
+
+```yaml
+# values.yaml
+backend:
+  tmdbApiKey: "PUT_YOUR_TMDB_KEY_HERE"   # ← the only blank you fill by hand
+```
+
+Either edit it here, or (better, keeps it out of git) leave the placeholder and pass it
+at install time with `--set` (shown below).
+
+### Step 5 — Render, then install
+
+```bash
+# render to plain YAML — touches NO cluster. Read it, confirm every {{ }} resolved:
 helm template movie-watchlist .
 
-# install / change / undo
-helm install  movie-watchlist .
-helm upgrade  movie-watchlist . --set backend.replicas=2
-helm rollback movie-watchlist 1
-helm uninstall movie-watchlist
+# install (key already in values.yaml):
+helm install movie-watchlist .
 
-# inspect
-helm list                 # current releases + revision number
-helm history movie-watchlist   # full audit trail of every revision
+# OR install while passing the key inline (keeps it out of the file):
+helm install movie-watchlist . --set backend.tmdbApiKey=YOUR_REAL_KEY
+```
+
+A successful install prints `STATUS: deployed` and `REVISION: 1`.
+
+> **Gotcha we hit:** if the namespaces already exist from an earlier `kubectl apply`,
+> Helm refuses to adopt them (`invalid ownership metadata`). Fix: delete the old ones
+> first — `kubectl delete namespace db-ns backend-ns frontend-ns` — then install. Wait
+> for them to finish terminating (`kubectl get ns`) before re-running install, or you get
+> a `namespace is being terminated` error.
+
+### Useful commands (reference)
+
+```bash
+# --- see what will happen, before it happens ---
+helm template movie-watchlist .                 # render to plain YAML, no cluster
+helm install  movie-watchlist . --dry-run --debug   # validate against the cluster
+
+# --- lifecycle ---
+helm install   movie-watchlist .                       # first deploy → revision 1
+helm upgrade   movie-watchlist . --set backend.replicas=2   # change → revision 2
+helm rollback  movie-watchlist 1                       # undo back to revision 1
+helm uninstall movie-watchlist                         # remove everything
+
+# --- inspect ---
+helm list                        # releases + current revision
+helm history movie-watchlist     # full audit trail of every revision
+helm get values movie-watchlist  # what values this release was installed with
+
+# --- check the running app ---
+kubectl get pods -A                         # all tiers; db-0/backend/frontend = Running
+kubectl get svc -A | grep 30080             # confirm frontend NodePort is bound
+kubectl get pods -n frontend-ns-helm -o wide  # which node the frontend is on
+curl -I http://localhost:30080              # run on the node — HTTP 200 = serving
+# then browse: http://<EC2_PUBLIC_IP>:30080
 ```
 
 The two you lean on most while learning: `helm template` (see rendered output) and
